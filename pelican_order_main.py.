@@ -1,0 +1,331 @@
+
+from __future__ import annotations
+
+import os
+import uuid
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+
+DEDICATION = "Barbara McLeish"
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+class PelicanNode(BaseModel):
+    node_id: str = Field(default_factory=lambda: new_id("node"))
+    ticker: str
+    quadrant_id: str
+    sd_tier: int = 1
+    loop_count: int = 0
+    initial_capital: float
+    current_value: float
+    is_tracking: bool = True
+    entered_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class PelicanQuadrant(BaseModel):
+    quadrant_id: str = Field(default_factory=lambda: new_id("quad"))
+    node_ids: List[str] = Field(default_factory=list)
+    is_cash: bool = False
+    crystallized: bool = False
+    cash_balance: float = 0.0
+
+
+class PelicanPortfolio(BaseModel):
+    portfolio_id: str = Field(default_factory=lambda: new_id("pelican"))
+    generation: int = 0
+    quadrants: Dict[str, PelicanQuadrant] = Field(default_factory=dict)
+    nodes: Dict[str, PelicanNode] = Field(default_factory=dict)
+    total_invested: float = 0.0
+    cash_balance: float = 0.0
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class PelicanEvent(BaseModel):
+    event_id: str = Field(default_factory=lambda: new_id("evt"))
+    portfolio_id: str
+    node_id: Optional[str] = None
+    ticker: Optional[str] = None
+    event_type: str
+    loop_count: int = 0
+    current_value: float = 0.0
+    exit_threshold: float = 0.0
+    detail: str = ""
+    timestamp: datetime = Field(default_factory=utcnow)
+
+
+class Config:
+    TRADING_DAYS_PER_WEEK = 4
+    SLOTS_PER_QUADRANT = 3
+    MAX_LOOPS = 3
+    TARGET_MULTIPLIER = 2.0
+
+    SD_TIERS: Dict[int, Dict[str, float]] = {
+        1: {"confidence": 0.90, "weekly": 0.01, "ratio": 2 / 3},
+        2: {"confidence": 0.95, "weekly": 0.05, "ratio": 5 / 6},
+        3: {"confidence": 0.99, "weekly": 0.10, "ratio": 6 / 9},
+    }
+
+
+def exit_threshold(loop_count: int, sd_tier: int) -> float:
+    tier = Config.SD_TIERS[sd_tier]
+    return round(Config.TARGET_MULTIPLIER * tier["confidence"] * tier["ratio"], 4)
+
+
+def daily_target(sd_tier: int) -> float:
+    tier = Config.SD_TIERS[sd_tier]
+    return tier["weekly"] / Config.TRADING_DAYS_PER_WEEK
+
+
+class PelicanRepository(ABC):
+    @abstractmethod
+    def save_portfolio(self, p: PelicanPortfolio) -> None: ...
+    @abstractmethod
+    def get_portfolio(self, pid: str) -> PelicanPortfolio: ...
+    @abstractmethod
+    def list_portfolios(self) -> List[PelicanPortfolio]: ...
+    @abstractmethod
+    def record_event(self, e: PelicanEvent) -> None: ...
+    @abstractmethod
+    def history(self, pid: str, limit: int = 200) -> List[PelicanEvent]: ...
+
+
+class MemoryPelicanRepository(PelicanRepository):
+    def __init__(self, history_limit: int = 5000):
+        self._portfolios: Dict[str, PelicanPortfolio] = {}
+        self._events: Dict[str, List[PelicanEvent]] = {}
+        self._history_limit = history_limit
+
+    def save_portfolio(self, p: PelicanPortfolio) -> None:
+        p.updated_at = utcnow()
+        self._portfolios[p.portfolio_id] = p.model_copy(deep=True)
+
+    def get_portfolio(self, pid: str) -> PelicanPortfolio:
+        if pid not in self._portfolios:
+            raise KeyError(f"portfolio {pid} not found")
+        return self._portfolios[pid].model_copy(deep=True)
+
+    def list_portfolios(self) -> List[PelicanPortfolio]:
+        return [p.model_copy(deep=True) for p in self._portfolios.values()]
+
+    def record_event(self, e: PelicanEvent) -> None:
+        bucket = self._events.setdefault(e.portfolio_id, [])
+        bucket.append(e.model_copy(deep=True))
+        if len(bucket) > self._history_limit:
+            del bucket[: len(bucket) - self._history_limit]
+
+    def history(self, pid: str, limit: int = 200) -> List[PelicanEvent]:
+        return [e.model_copy(deep=True) for e in reversed(self._events.get(pid, [])[-limit:])]
+
+
+class PelicanEngine:
+    def __init__(self, repo: PelicanRepository):
+        self.repo = repo
+
+    def create_portfolio(self, seed_capital: float, generation: int = 0) -> PelicanPortfolio:
+        p = PelicanPortfolio(generation=generation, cash_balance=seed_capital)
+        for i in range(4):
+            q = PelicanQuadrant(is_cash=(i == 3))
+            p.quadrants[q.quadrant_id] = q
+        self.repo.save_portfolio(p)
+        return p
+
+    def recruit(self, pid: str, ticker: str, capital: float,
+                sd_tier: int = 1, quadrant_id: Optional[str] = None) -> PelicanNode:
+        p = self.repo.get_portfolio(pid)
+        if quadrant_id is None:
+            for q in p.quadrants.values():
+                if not q.is_cash and len(q.node_ids) < Config.SLOTS_PER_QUADRANT:
+                    quadrant_id = q.quadrant_id
+                    break
+        if quadrant_id is None:
+            raise ValueError("no quadrant with free slots")
+        node = PelicanNode(
+            ticker=ticker, quadrant_id=quadrant_id, sd_tier=sd_tier,
+            initial_capital=capital, current_value=capital,
+        )
+        p.nodes[node.node_id] = node
+        p.quadrants[quadrant_id].node_ids.append(node.node_id)
+        p.cash_balance -= capital
+        p.total_invested += capital
+        self.repo.save_portfolio(p)
+        self.repo.record_event(PelicanEvent(
+            portfolio_id=pid, node_id=node.node_id, ticker=ticker,
+            event_type="ENTER", current_value=capital,
+            detail=f"sd_tier={sd_tier} capital={capital}",
+        ))
+        return node
+
+    def tick(self, pid: str, prices: Dict[str, float]) -> Dict:
+        p = self.repo.get_portfolio(pid)
+        summary = {"tracked": 0, "missed": 0, "looped": 0, "released": 0, "crystallized": 0}
+        for node_id, node in list(p.nodes.items()):
+            if node.ticker not in prices:
+                continue
+            node.current_value = node.initial_capital * prices[node.ticker]
+            node.updated_at = utcnow()
+            target = daily_target(node.sd_tier)
+            node.is_tracking = (prices[node.ticker] - 1.0) >= target
+            if node.is_tracking:
+                summary["tracked"] += 1
+                self.repo.record_event(PelicanEvent(
+                    portfolio_id=pid, node_id=node_id, ticker=node.ticker,
+                    event_type="TRACK", loop_count=node.loop_count,
+                    current_value=node.current_value,
+                ))
+            else:
+                summary["missed"] += 1
+                if node.loop_count < Config.MAX_LOOPS:
+                    node.loop_count += 1
+                    summary["looped"] += 1
+                    self.repo.record_event(PelicanEvent(
+                        portfolio_id=pid, node_id=node_id, ticker=node.ticker,
+                        event_type="LOOP_UP", loop_count=node.loop_count,
+                        current_value=node.current_value,
+                        detail=f"missed daily target {target:.4f}",
+                    ))
+            threshold = exit_threshold(node.loop_count, node.sd_tier)
+            if node.current_value >= node.initial_capital * threshold:
+                self._release(p, node, threshold)
+                summary["released"] += 1
+        for q in list(p.quadrants.values()):
+            if q.is_cash and not q.crystallized:
+                expected = Config.SLOTS_PER_QUADRANT * (p.total_invested / max(len(p.nodes) + 1, 1))
+                if q.cash_balance >= expected:
+                    self._crystallize(p, q)
+                    summary["crystallized"] += 1
+        self.repo.save_portfolio(p)
+        return summary
+
+    def _release(self, p: PelicanPortfolio, node: PelicanNode, threshold: float) -> None:
+        profit = node.current_value - node.initial_capital
+        cash = next((q for q in p.quadrants.values() if q.is_cash and not q.crystallized), None)
+        if cash is not None:
+            cash.cash_balance += node.current_value
+        quad = p.quadrants.get(node.quadrant_id)
+        if quad and node.node_id in quad.node_ids:
+            quad.node_ids.remove(node.node_id)
+        del p.nodes[node.node_id]
+        self.repo.record_event(PelicanEvent(
+            portfolio_id=p.portfolio_id, node_id=node.node_id, ticker=node.ticker,
+            event_type="RELEASE", loop_count=node.loop_count,
+            current_value=node.current_value, exit_threshold=threshold,
+            detail=f"profit={profit:.2f}",
+        ))
+
+    def _crystallize(self, p: PelicanPortfolio, cash: PelicanQuadrant) -> None:
+        cash.is_cash = False
+        cash.crystallized = True
+        new_cash = PelicanQuadrant(is_cash=True)
+        p.quadrants[new_cash.quadrant_id] = new_cash
+        p.generation += 1
+        self.repo.record_event(PelicanEvent(
+            portfolio_id=p.portfolio_id,
+            event_type="CRYSTALLIZE",
+            detail=f"In memory of {DEDICATION} — new generation={p.generation}",
+        ))
+
+    def snapshot(self, pid: str) -> Dict:
+        p = self.repo.get_portfolio(pid)
+        active = list(p.nodes.values())
+        return {
+            "portfolio_id": p.portfolio_id,
+            "generation": p.generation,
+            "quadrants": len(p.quadrants),
+            "active_nodes": len(active),
+            "total_invested": round(p.total_invested, 2),
+            "cash_balance": round(p.cash_balance, 2),
+            "aggregate_value": round(sum(n.current_value for n in active), 2),
+            "dedication": f"In memory of {DEDICATION}",
+            "nodes": [
+                {
+                    "node_id": n.node_id, "ticker": n.ticker,
+                    "sd_tier": n.sd_tier, "loop_count": n.loop_count,
+                    "current_value": round(n.current_value, 2),
+                    "exit_threshold": exit_threshold(n.loop_count, n.sd_tier),
+                    "is_tracking": n.is_tracking,
+                }
+                for n in active
+            ],
+        }
+
+
+app = FastAPI(title="The Pelican Order", description=f"In memory of {DEDICATION}.", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+                   allow_methods=["*"], allow_headers=["*"])
+repository = MemoryPelicanRepository()
+engine = PelicanEngine(repository)
+
+
+class CreatePortfolioRequest(BaseModel):
+    seed_capital: float
+
+class RecruitRequest(BaseModel):
+    ticker: str
+    capital: float
+    sd_tier: int = 1
+
+class TickRequest(BaseModel):
+    prices: Dict[str, float]
+
+
+@app.get("/")
+def health():
+    return {
+        "status": "online",
+        "system": "The Pelican Order",
+        "equation": "Flow + Coupling + Persistence = Coherence",
+        "dedication": f"In memory of {DEDICATION}",
+        "backend": type(repository).__name__,
+        "timestamp": utcnow().isoformat(),
+    }
+
+
+@app.post("/portfolio")
+def create_portfolio(req: CreatePortfolioRequest):
+    p = engine.create_portfolio(req.seed_capital)
+    return {"portfolio_id": p.portfolio_id, "generation": p.generation}
+
+
+@app.post("/portfolio/{pid}/recruit")
+def recruit(pid: str, req: RecruitRequest):
+    try:
+        node = engine.recruit(pid, req.ticker, req.capital, req.sd_tier)
+    except (KeyError, ValueError) as e:
+        return {"error": str(e)}
+    return node.model_dump(mode="json")
+
+
+@app.post("/portfolio/{pid}/tick")
+def tick(pid: str, req: TickRequest):
+    try:
+        return engine.tick(pid, req.prices)
+    except KeyError as e:
+        return {"error": str(e)}
+
+
+@app.get("/portfolio/{pid}")
+def snapshot(pid: str):
+    try:
+        return engine.snapshot(pid)
+    except KeyError as e:
+        return {"error": str(e)}
+
+
+@app.get("/portfolio/{pid}/history")
+def history(pid: str, limit: int = 200):
+    return [e.model_dump(mode="json") for e in repository.history(pid, limit)
